@@ -113,7 +113,40 @@ class State(TypedDict):
 # -----------------------------
 # 2) LLM
 # -----------------------------
-llm = ChatOllama(model="llama3b", temperature=0.2, max_tokens=2048)
+llm = ChatOllama(model="gpt-oss:120b-cloud", temperature=0.3)
+
+# Use a deterministic model for every schema/Pydantic response.
+structured_llm = ChatOllama(model="gpt-oss:120b-cloud", temperature=0)
+
+def _invoke_structured(schema, messages, label: str):
+    """Prefer Ollama JSON-schema output; retry once with JSON mode."""
+    try:
+        runner = structured_llm.with_structured_output(
+            schema, method="json_schema", include_raw=True
+        )
+        result = runner.invoke(messages)
+        if not isinstance(result, dict):
+            return result
+        if result.get("parsed") is not None:
+            return result["parsed"]
+        print(f"[{label}] json_schema parse failed: {result.get('parsing_error')}")
+        print(f"[{label}] raw response: {result.get('raw')}")
+    except Exception as e:
+        print(f"[{label}] json_schema failed: {e}")
+
+    # Fallback for models/providers that do not fully obey json_schema.
+    schema_hint = schema.model_json_schema()
+    retry_messages = [
+        SystemMessage(
+            content=(
+                "Return ONLY valid JSON. No Markdown, no code fences, no commentary. "
+                f"The JSON must match this schema exactly:\n{schema_hint}"
+            )
+        ),
+        *messages,
+    ]
+    runner = structured_llm.with_structured_output(schema, method="json_mode")
+    return runner.invoke(retry_messages)
 
 # -----------------------------
 # 3) Router
@@ -133,13 +166,22 @@ If needs_research=true:
 """
 
 def router_node(state: State) -> dict:
-    decider = llm.with_structured_output(RouterDecision)
-    decision = decider.invoke(
-        [
-            SystemMessage(content=ROUTER_SYSTEM),
-            HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
-        ]
-    )
+    messages = [
+        SystemMessage(content=ROUTER_SYSTEM),
+        HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
+    ]
+    try:
+        decision = _invoke_structured(RouterDecision, messages, "router")
+    except Exception as e:
+        # Safe fallback: research rather than crashing or inventing freshness.
+        print(f"[router] structured output failed completely: {e}")
+        decision = RouterDecision(
+            needs_research=True,
+            mode="hybrid",
+            reason="Structured router failed; using safe research fallback.",
+            queries=[state["topic"]],
+            max_results_per_query=5,
+        )
 
     if decision.mode == "open_book":
         recency_days = 7
@@ -212,19 +254,23 @@ def research_node(state: State) -> dict:
     if not raw:
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack)
-    pack = extractor.invoke(
-        [
-            SystemMessage(content=RESEARCH_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"As-of date: {state['as_of']}\n"
-                    f"Recency days: {state['recency_days']}\n\n"
-                    f"Raw results:\n{raw}"
-                )
-            ),
-        ]
-    )
+    messages = [
+        SystemMessage(content=RESEARCH_SYSTEM),
+        HumanMessage(
+            content=(
+                f"As-of date: {state['as_of']}\n"
+                f"Recency days: {state['recency_days']}\n\n"
+                f"Raw results:\n{raw}"
+            )
+        ),
+    ]
+    try:
+        pack = _invoke_structured(EvidencePack, messages, "research")
+    except Exception as e:
+        print(f"[research] structured extraction failed: {e}")
+        pack = EvidencePack(
+            evidence=[EvidenceItem(**r) for r in raw if r.get("url")]
+        )
 
     dedup = {}
     for e in pack.evidence:
@@ -261,26 +307,24 @@ Output must match Plan schema.
 """
 
 def orchestrator_node(state: State) -> dict:
-    planner = llm.with_structured_output(Plan)
     mode = state.get("mode", "closed_book")
     evidence = state.get("evidence", [])
 
     forced_kind = "news_roundup" if mode == "open_book" else None
 
-    plan = planner.invoke(
-        [
-            SystemMessage(content=ORCH_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Topic: {state['topic']}\n"
-                    f"Mode: {mode}\n"
-                    f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
-                    f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
-                    f"Evidence:\n{[e.model_dump() for e in evidence][:16]}"
-                )
-            ),
-        ]
-    )
+    messages = [
+        SystemMessage(content=ORCH_SYSTEM),
+        HumanMessage(
+            content=(
+                f"Topic: {state['topic']}\n"
+                f"Mode: {mode}\n"
+                f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
+                f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
+                f"Evidence:\n{[e.model_dump() for e in evidence][:16]}"
+            )
+        ),
+    ]
+    plan = _invoke_structured(Plan, messages, "orchestrator")
     if forced_kind:
         plan.blog_kind = "news_roundup"
 
@@ -400,24 +444,26 @@ Return strictly GlobalImagePlan.
 """
 
 def decide_images(state: State) -> dict:
-    planner = llm.with_structured_output(GlobalImagePlan)
     merged_md = state["merged_md"]
     plan = state["plan"]
     assert plan is not None
 
-    image_plan = planner.invoke(
-        [
-            SystemMessage(content=DECIDE_IMAGES_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Blog kind: {plan.blog_kind}\n"
-                    f"Topic: {state['topic']}\n\n"
-                    "Insert placeholders + propose image prompts.\n\n"
-                    f"{merged_md}"
-                )
-            ),
-        ]
-    )
+    messages = [
+        SystemMessage(content=DECIDE_IMAGES_SYSTEM),
+        HumanMessage(
+            content=(
+                f"Blog kind: {plan.blog_kind}\n"
+                f"Topic: {state['topic']}\n\n"
+                "Insert placeholders + propose image prompts.\n\n"
+                f"{merged_md}"
+            )
+        ),
+    ]
+    try:
+        image_plan = _invoke_structured(GlobalImagePlan, messages, "images")
+    except Exception as e:
+        print(f"[images] structured planning failed: {e}")
+        image_plan = GlobalImagePlan(md_with_placeholders=merged_md, images=[])
 
     return {
         "md_with_placeholders": image_plan.md_with_placeholders,
@@ -554,4 +600,3 @@ g.add_edge("worker", "reducer")
 g.add_edge("reducer", END)
 
 app = g.compile()
-app
